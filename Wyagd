@@ -1,0 +1,63 @@
+def wtags_login() -> bool:
+    global wtags_logged_in
+    if not WTAGS_ENABLED:
+        return False
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Content-Type": "application/json",
+            "Origin": "https://my.wirelesstag.net",
+            "Referer": "https://my.wirelesstag.net/eth/signin.html",
+            "Connection": "keep-alive"
+        }
+        payload = {
+            "email": WTAGS_EMAIL,
+            "password": WTAGS_PASSWORD
+        }
+        resp = wtags_session.post(
+            WTAGS_SIGNIN_URL,
+            json=payload,
+            headers=headers,
+            timeout=15
+        )
+        logger.info(f"WTAGS SignIn → status: {resp.status_code}")
+        logger.info(f"WTAGS SignIn → финальный URL: {resp.url}")
+        logger.info(f"WTAGS SignIn → длина ответа: {len(resp.text)}")
+        logger.info(f"WTAGS SignIn → ПОЛНЫЙ ОТВЕТ СЕРВЕРА: {resp.text}")
+
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+                logger.info(f"WTAGS SignIn → распарсенный JSON: {data}")
+
+                d = data.get("d")
+                if d is None:
+                    logger.warning("WTAGS SignIn: поле 'd' = null или отсутствует")
+                    # Возможно, логин прошёл, но сессия не вернулась
+                    wtags_logged_in = True  # пробуем считать успехом
+                    return True
+
+                if isinstance(d, dict):
+                    success = d.get("success", False)
+                    if success:
+                        wtags_logged_in = True
+                        logger.info("WTAGS: логин успешен (success: true)")
+                        return True
+                    else:
+                        err_msg = d.get("errorMessage", "неизвестная ошибка")
+                        logger.error(f"WTAGS SignIn failed: {err_msg}")
+                        return False
+                else:
+                    logger.warning("WTAGS SignIn: 'd' не словарь")
+                    return False
+            except ValueError as ve:
+                logger.error(f"WTAGS SignIn: ответ не JSON - {str(ve)}")
+                logger.info(f"WTAGS SignIn сырой ответ: {resp.text[:1000]}")
+                return False
+        else:
+            logger.error(f"WTAGS SignIn HTTP ошибка: {resp.status_code}")
+            return False
+    except Exception as e:
+        logger.error(f"WTAGS SignIn исключение: {str(e)}")
+        return False
