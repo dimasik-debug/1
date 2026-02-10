@@ -1,3 +1,7 @@
+
+logger.info(f"WTAGS SignIn → ПОЛНЫЙ ОТВЕТ СЕРВЕРА: {resp.text}")
+
+
 def wtags_get_tags() -> List[Dict]:
     wtags_login()  # вызываем всегда, даже если уже логин был
     try:
