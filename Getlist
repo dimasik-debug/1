@@ -1,31 +1,16 @@
+battery = tag.get("batteryVolt", "N/A")
+temperature = tag.get("temperature", "N/A")
+text += f"{emoji} {name} (UUID: {uuid})\n   Темп: {temperature}°C   Батарея: {battery}V\n"
 
-logger.info(f"WTAGS SignIn → ПОЛНЫЙ ОТВЕТ СЕРВЕРА: {resp.text}")
+
+readings = wtags_get_readings(uuid)
+text = f"Данные тега {tag_name} ({uuid}):\n\n"
+text += f"Температура: {readings.get('temperature', 'N/A')} °C\n"
+text += f"Влажность: {readings.get('humidity', 'N/A')} %\n"
+text += f"Батарея: {readings.get('batteryVolt', 'N/A')} V\n"
+text += f"Alive: {'Да' if readings.get('alive', False) else 'Нет'}\n"
 
 
-def wtags_get_tags() -> List[Dict]:
-    wtags_login()  # вызываем всегда, даже если уже логин был
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "Content-Type": "application/json"
-        }
-        resp = wtags_session.post(
-            "https://my.wirelesstag.net/ethClient.asmx/GetTagList",
-            json={},  # пустой body, как в твоём Network
-            headers=headers,
-            timeout=15
-        )
-        logger.info(f"WTAGS GetTagList → status: {resp.status_code}")
-        logger.info(f"WTAGS GetTagList → ПОЛНЫЙ ОТВЕТ: {resp.text}")
-
-        if resp.status_code == 200:
-            data = resp.json()
-            tags = data.get("d", [])
-            logger.info(f"Получено тегов: {len(tags)}")
-            return tags
-        else:
-            return []
-    except Exception as e:
-        logger.error(f"WTAGS GetTagList error: {str(e)}")
+if not wtags_logged_in:
+    if not wtags_login():
         return []
