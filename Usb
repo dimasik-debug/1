@@ -1,71 +1,39 @@
-Вот пошаговая реализация твоего запроса.
-Что добавляем в бота
-Две новые кнопки в главном меню: USB1 и USB2
-При нажатии на USB1 или USB2 открывается подменю с 8 кнопками (2 ряда по 4 шт.)
-Каждая из 8 кнопок отправляет команду в Delphi через WebSocket:
-usb1, 01, true   или   usb1, 01, false   (для USB1)
-usb2, 01, true   или   usb2, 01, false   (для USB2)
-Состояние каждой из 8 кнопок запоминается (в bot_data)
-Кнопки подсвечиваются:
-🟢 зелёный — true (включено)
-🔴 красный — false (выключено)
-1. Обновляем главное меню (get_reply_keyboard)
-def get_reply_keyboard():
-    keyboard = [
-        [KeyboardButton("🔌 Выключатели"), KeyboardButton("🌡️ Датчики")],
-        [KeyboardButton("📋 Проекты"), KeyboardButton("📜 Список устройств")],
-        [KeyboardButton("🏷️ Wireless Tags")],
-        [KeyboardButton("USB1"), KeyboardButton("USB2")]   # ← новые кнопки
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
-2. Обновляем handle_keyboard_buttons (добавляем обработку новых кнопок)
-async def handle_keyboard_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not has_access(update.effective_user.id):
-        await update.message.reply_text("Доступ запрещён")
-        return
-
-    text = update.message.text.strip()
-
-    if text in ["🔌 Выключатели", "Выключатели"]:
-        await show_switch(update, context)
-    elif text in ["🌡️ Датчики", "Датчики"]:
-        await show_temp(update, context)
-    elif text in ["📋 Проекты", "Проекты"]:
-        await projects(update, context)
-    elif text in ["📜 Список устройств", "Список устройств"]:
-        await list_devices(update, context)
-    elif text in ["🏷️ Wireless Tags", "Wireless Tags"]:
-        await wlist_tags(update, context)
-
-    # ── Новые кнопки USB ──────────────────────────────────────
-    elif text == "USB1":
-        await show_usb_menu(update, context, usb_num=1)
-    elif text == "USB2":
-        await show_usb_menu(update, context, usb_num=2)
-
-    elif text == "/start":
-        await start(update, context)
-    else:
-        await update.message.reply_text("Неизвестная кнопка")
-3. Новая функция — показ подменю USB (8 кнопок)
+Отлично, сейчас всё работает как задумано: состояния сохраняются, кнопки меняют цвет, команды формируются правильно.
+Ты хочешь, чтобы каждая кнопка отправляла свою уникальную команду в зависимости от номера порта, а не всегда usbX, 01, true/false.
+Например:
+Кнопка «Обогреватель» (порт 1) → usb1, 01, true / usb1, 01, false
+Кнопка «Вентилятор» (порт 2) → usb1, 02, true / usb1, 02, false
+Кнопка «Свет в гараже» (порт 3) → usb1, 03, true / usb1, 03, false
+и так далее до 8 портов
+Это легко сделать — нужно только в callback_data и в формировании команды использовать номер порта вместо фиксированного 01.
+Что меняем
+Нужно обновить только две функции:
+show_usb_menu — чтобы callback_data содержал правильный номер порта
+button_callback — чтобы команда формировалась с нужным номером порта (usbX, NN, true/false)
+1. Обновлённая функция show_usb_menu
 async def show_usb_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, usb_num: int):
-    # Ключ для хранения состояний в bot_data
-    state_key = f"usb{usb_num}_states"  # usb1_states или usb2_states
+    names = USB1_NAMES if usb_num == 1 else USB2_NAMES
+    
+    state_key = f"usb{usb_num}_states"
     if state_key not in context.bot_data:
-        context.bot_data[state_key] = [False] * 8  # 8 кнопок, по умолчанию выключены
+        context.bot_data[state_key] = [False] * 8
 
     states = context.bot_data[state_key]
 
     keyboard = []
     row = []
+    
     for i in range(8):
         state = states[i]
         emoji = "🟢" if state else "🔴"
-        text = f"{emoji} {i+1}"
-        callback_data = f"usb{usb_num}_toggle_{i+1}"
-        row.append(InlineKeyboardButton(text, callback_data=callback_data))
+        button_text = f"{emoji} {names[i]}"
+        
+        # callback_data теперь содержит номер порта явно
+        callback_data = f"usb{usb_num}_toggle_{i+1:02d}"  # 01, 02, ..., 08
+        
+        row.append(InlineKeyboardButton(button_text, callback_data=callback_data))
 
-        if len(row) == 4:
+        if len(row) == 2:  # 2 колонки
             keyboard.append(row)
             row = []
 
@@ -75,15 +43,19 @@ async def show_usb_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, usb_
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
-        f"Управление USB{usb_num} (8 устройств)",
+        f"Управление USB{usb_num} ({len(names)} устройств)",
         reply_markup=reply_markup
     )
-4. Обработчик нажатий на inline-кнопки USB (добавь в button_callback)
-Найди функцию async def button_callback(...) и добавь в начало или в подходящее место:
+2. Обновлённый обработчик в button_callback
+Найди блок if data.startswith("usb1_toggle_") or data.startswith("usb2_toggle_"):
+и замени его полностью на этот:
 # ── Обработка USB-кнопок ──────────────────────────────────────
     if data.startswith("usb1_toggle_") or data.startswith("usb2_toggle_"):
-        usb_num = 1 if data.startswith("usb1_") else 2
-        port_num = int(data.split("_")[-1])  # 1..8
+        # Разбираем callback_data: usb1_toggle_01, usb2_toggle_03 и т.д.
+        parts = data.split("_")
+        usb_num = 1 if parts[0] == "usb1" else 2
+        port_str = parts[-1]  # "01", "02", ..., "08"
+        port_num = int(port_str)  # 1..8
 
         state_key = f"usb{usb_num}_states"
         if state_key not in context.bot_data:
@@ -94,14 +66,15 @@ async def show_usb_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, usb_
         new_state = not old_state
         states[port_num - 1] = new_state
 
-        # Сохраняем состояние
+        # Сохраняем
         context.bot_data[state_key] = states
 
-        # Формируем команду для Delphi
-        command_str = f"usb{usb_num}, 01, {str(new_state).lower()}"
+        # Формируем команду с номером порта (01, 02, ..., 08)
+        port_formatted = f"{port_num:02d}"  # 01, 02, ..., 08
+        command_str = f"usb{usb_num}, {port_formatted}, {str(new_state).lower()}"
 
-        # Отправляем в WebSocket (только если есть подключённый клиент)
-        client_id = "delphi"  # ← замени на реальный client_id твоего Delphi
+        # Отправляем в Delphi
+        client_id = "delphi"  # ← замени на реальный client_id твоего клиента
         success = send_to_delphi(client_id, {
             "command": "usb_control",
             "data": command_str
@@ -109,25 +82,34 @@ async def show_usb_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, usb_
 
         status = "успешно отправлена" if success else "клиент не подключён"
 
+        # Обновляем сообщение
         await query.edit_message_text(
-            f"USB{usb_num} порт {port_num} → {new_state}\n"
+            f"USB{usb_num} {names[port_num-1]} → {new_state}\n"
             f"Команда: {command_str}\n"
             f"Состояние сохранено ✓\n"
             f"В Delphi: {status}"
         )
 
+        # Опционально: переоткрыть меню, чтобы обновить цвета кнопок
+        # await show_usb_menu(update, context, usb_num)
+        # await query.delete_message()
+
         return
-5. Дополнительно: обновление кнопок после переключения (опционально)
-Если хочешь, чтобы после нажатия меню сразу обновлялось (кнопки меняли цвет), можно переотправлять клавиатуру:
-# После изменения состояния можно переотправить меню
-        await show_usb_menu(update, context, usb_num)
-        await query.delete_message()  # удалить старое сообщение
-Но это уже по вкусу.
-Итог: что добавилось
-Две кнопки в главном меню: USB1, USB2
-Подменю с 8 inline-кнопками (🟢 / 🔴)
-Запоминание состояния в context.bot_data
-Отправка команды вида usb1, 01, true / usb2, 01, false через send_to_delphi
-Обработка нажатий в button_callback
-После вставки кода → commit → push → деплой → протестируй.
-Если нужно изменить формат команды, client_id или добавить подтверждение перед отправкой — скажи, подправим.
+Что изменилось
+callback_data теперь usb1_toggle_01, usb1_toggle_02 и т.д. (с двухзначным номером порта)
+Команда формируется динамически: usb1, 01, true, usb1, 02, false, usb2, 03, true и т.д.
+В ответе показывается название устройства:
+USB1 Обогреватель → True
+вместо просто USB1 порт 1 → True
+После замены
+Сохрани файл
+Закоммить и запушить:
+git add tuya_bot.py
+git commit -m "usb: динамический порт в команде + названия устройств"
+git push
+Дождись деплоя
+Нажми USB1 → увидишь меню с названиями
+Нажми любую кнопку → команда будет с правильным номером порта
+Если хочешь изменить названия устройств — просто отредактируй списки USB1_NAMES и USB2_NAMES в начале файла.
+Готово! Теперь каждая кнопка отправляет свою уникальную команду.
+Если нужно добавить подтверждение («Вы уверены?») перед отправкой или что-то ещё — скажи.
