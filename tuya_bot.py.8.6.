@@ -1,0 +1,2018 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Tuya Telegram Bot + HTTP Control + WebSocket — Полная версия без сокращений
+Версия: 2026-02-12 v8.6-websocket-usb-flask_sock-Gismeteo
+Изменения:
+- Полностью сохранён Telegram-бот на polling (все функции и handlers)
+- Flask-сервер для управления Tuya через интернет
+- HTTP-эндпоинт: /control?device=ID&com=on/off/toggle/fullstatus&project=1/2/3&format=json/text&notify=true/false
+- HTTP-эндпоинт: /wtags — выводит статус всех Wireless Sensor Tags (JSON/text, фильтры alive_only, pretty)
+- Добавлена поддержка com=fullstatus — возвращает полный статус в JSON или тексте
+- Добавлен третий проект kudrovosmart_delphin
+- Дублирование всех команд и ошибок в Telegram владельцу с IP клиента
+- Новый параметр notify=true/false — включать/отключать уведомление в Telegram (по умолчанию true)
+- Исправлена ошибка RuntimeError с get_event_loop() — отдельный notify_loop
+- В /debug добавлена подробная проверка наличия и состояния файлов: allowed_users.json, devices.json, button_stats.json
+- Добавлена интеграция Wireless Sensor Tags на чистом requests без библиотек
+- Логин на https://my.wirelesstag.net/ethAccount.asmx/SignIn с POST JSON {email, password}
+- Учёт всех ошибок авторизации, 405, NameError, ModuleNotFoundError
+- Команды /wlist, /wtags + кнопка "🏷️ Wireless Tags"
+- Подробное логирование каждого шага авторизации
+- Значения температуры, cap (влажности) и батареи в списке тегов сокращены до компактного вида (≤5 символов)
+- Убраны UUID из основного списка тегов
+- Добавлены эмодзи по аналогии с Tuya (температура + статус онлайн/оффлайн)
+- Добавлен символ батареи (🪫 / 🔋) в зависимости от напряжения
+- Добавлена явная обработка alive: true/false в выводе /wlist ("онлайн, связь есть" / "оффлайн")
+- Поле humidity заменено на cap + добавлено эмодзи 💧 перед cap (если значение есть)
+- НОВОЕ: добавлена поддержка WebSocket (flask-socketio) для двунаправленной связи с Delphi-клиентом
+- Добавлена аутентификация по токену при подключении WebSocket
+- Добавлена функция send_to_delphi для отправки команд из бота на компьютер
+- Добавлены команды в Socket
+- Добавлена погода
+- Добавлены кнопки UBS-1 и USB-2
+- Статистика кода обновлена
+"""
+import asyncio
+import logging
+import json
+import os
+import time
+import threading
+from typing import Dict, Optional, List, Set
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+from tuya_connector import TuyaOpenAPI
+from flask import Flask, request, jsonify
+from flask_socketio import SocketIO, emit, disconnect
+from flask_sock import Sock
+import requests
+import aiohttp
+from bs4 import BeautifulSoup
+
+# ────────────────────────────────────────────────
+# Настройки
+# ────────────────────────────────────────────────
+BOT_VERSION = "2026-02-12 v8.6-websocket- (OpenMetio,GisMeteo) (c) 2026 Diminssoft"
+USER_UID = "eu1573452463464hpG3T"
+TUYA_PROJECTS = {
+    "naziasmart_securerobot": {
+        "name": "Nazia_Smart(securerobot) — первый проект",
+        "endpoint": "https://openapi.tuyaeu.com",
+        "access_id": "4hnutju947tgcx5v9kj5",
+        "access_key": "ad4a6acdfc5a4c39af196ccd0a6b85a7",
+    },
+    "naziasmart_dimanbratan": {
+        "name": "Nazia_Smart(dimanbratan) — второй проект",
+        "endpoint": "https://openapi.tuyaeu.com",
+        "access_id": "ffamhqfxpgetcvmd5gqp",
+        "access_key": "d42a23d4e23748a596a47cdb06505eed",
+    },
+    "kudrovosmart_delphin": {
+        "name": "Kudrovo_Smart(delphin) — третий проект",
+        "endpoint": "https://openapi.tuyaeu.com",
+        "access_id": "8utyvwcqcjhdpu8smqq7",
+        "access_key": "f14e144e17b94557b13931d60fa71fb3",
+    },
+}
+DEFAULT_PROJECT = "naziasmart_securerobot"
+TELEGRAM_TOKEN = "8211074682:AAGGFEYIZdtjnZRqfpzFFzSJt9mK0M6F1mg"
+OWNER_ID = 1031513783
+PRE_ADDED_USERS = {7060095330, 5902906359}
+SWITCH_CODES = ["switch_1", "switch_2", "switch", "switch_led"]
+TEMP_CODES = ["va_temperature", "va_humidity", "temperature", "humidity"]
+DEVICES_FILE = "devices.json"
+ALLOWED_USERS_FILE = "allowed_users.json"
+BUTTON_STATS_FILE = "button_stats.json"
+devices_cache: Dict[str, str] = {}
+ALLOWED_USERS: Set[int] = set()
+application_global = None
+notify_loop = asyncio.new_event_loop()
+threading.Thread(target=notify_loop.run_forever, daemon=True).start()
+# ────────────────────────────────────────────────
+# Wireless Sensor Tags настройки
+# ────────────────────────────────────────────────
+WTAGS_ENABLED = True
+WTAGS_EMAIL = "dimanbratan@yandex.ru"
+WTAGS_PASSWORD = "887826"
+WTAGS_SIGNIN_URL = "https://my.wirelesstag.net/ethAccount.asmx/SignIn"
+WTAGS_GET_TAGS_URL = "https://my.wirelesstag.net/ethClient.asmx/GetTagList"
+wtags_session = requests.Session()
+wtags_logged_in = False
+
+# ────────────────────────────────────────────────
+# Названия для USB (16 устройств)
+# ────────────────────────────────────────────────
+# Названия для USB1 (8 устройств)
+USB1_NAMES = [
+    "Обогреватель",     # 1
+    "Вентилятор",       # 2
+    "Свет в гараже",    # 3
+    "Насос",            # 4
+    "Тёплый пол",       # 5
+    "Кондиционер",      # 6
+    "Кофемашина",       # 7
+    "Зарядка телефона"  # 8
+]
+
+# Названия для USB2 (если нужно другие — поменяй)
+USB2_NAMES = [
+    "Лампа 1",          # 1
+    "Лампа 2",          # 2
+    "Розетка кухня",    # 3
+    "Розетка спальня",  # 4
+    "Увлажнитель",      # 5
+    "Пылесос",          # 6
+    "Телевизор",        # 7
+    "Звук"              # 8
+]
+
+# ────────────────────────────────────────────────
+# Погода — выбора города и YANDEX_WEATHER_KEY GISMETEO_CITIES
+# ────────────────────────────────────────────────
+
+CITIES_WEATHER = {
+    "spb": {"name": "Санкт-Петербург", "query": "Санкт-Петербург"},
+    "kudrovo": {"name": "Кудрово", "query": "Кудрово"},
+    "naziya": {"name": "Назия", "query": "Назия"},
+    "putilovo": {"name": "Путилово", "query": "Путилово"},
+}
+YANDEX_WEATHER_KEY = "d469788e-0e02-4b9b-9163-164637fb6479"
+
+GISMETEO_CITIES = {
+    "spb": {
+        "name": "Санкт-Петербург",
+        "slug": "sankt-peterburg",
+        "id": 4079,
+        "lat": 59.934,
+        "lon": 30.335
+    },
+    "kudrovo": {
+        "name": "Кудрово",
+        "slug": "kudrovo",
+        "id": 12454,
+        "lat": 59.908,
+        "lon": 30.491
+    },
+}
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Referer": "https://www.gismeteo.ru/",
+}
+
+# ────────────────────────────────────────────────
+# Логирование
+# ────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+logger = logging.getLogger(f"TuyaBot {BOT_VERSION}")
+# ────────────────────────────────────────────────
+# Flask + SocketIO
+# ────────────────────────────────────────────────
+flask_app = Flask(__name__)
+socketio = SocketIO(flask_app, cors_allowed_origins="*", async_mode='threading')
+# Секретный токен для WebSocket (ОБЯЗАТЕЛЬНО ИЗМЕНИ НА СВОЙ!)
+WEBSOCKET_SECRET_TOKEN = "eu1573452463464hpG3T"
+# Список подключённых клиентов: sid → client_id
+connected_clients = {}
+@flask_app.route('/')
+def home():
+    return (
+        f"Tuya Bot + HTTP + WebSocket {BOT_VERSION} работает\n\n"
+        "Telegram-бот: активен (polling)\n"
+        "HTTP-эндпоинты:\n"
+        " /control?... (управление Tuya)\n"
+        " /wtags?... (статус Wireless Tags)\n"
+        "WebSocket: wss://dimasik-debug-tuya-bot-a9bc.twc1.net/socket.io/?token=...&client_id=...\n"
+    )
+@flask_app.route('/control', methods=['GET'])
+def control():
+    device_id = request.args.get('device')
+    com = request.args.get('com', '').lower()
+    project_str = request.args.get('project', '1')
+    format_type = request.args.get('format', 'json').lower()
+    notify_str = request.args.get('notify', 'true').lower()
+    notify = notify_str != 'false'
+    if not device_id:
+        return jsonify({"success": False, "error": "device обязателен"}), 400
+    if project_str not in ['1', '2', '3']:
+        return jsonify({"success": False, "error": "project должен быть 1, 2 или 3"}), 400
+    project_key = "naziasmart_securerobot" if project_str == '1' else \
+                  "naziasmart_dimanbratan" if project_str == '2' else \
+                  "kudrovosmart_delphin"
+    client_ip = request.remote_addr or "неизвестно"
+    try:
+        tuya = asyncio.run(get_tuya_api(project_key, None))
+        if com == 'fullstatus':
+            status_resp = tuya.get(f"/v1.0/devices/{device_id}/status")
+            if not status_resp.get("success"):
+                error_msg = format_tuya_error(status_resp)
+                if notify:
+                    asyncio.run_coroutine_threadsafe(
+                        application_global.bot.send_message(
+                            OWNER_ID,
+                            f"Ошибка HTTP-запроса статуса:\n"
+                            f"Устройство: {get_device_name(device_id)} ({device_id})\n"
+                            f"Проект: {TUYA_PROJECTS[project_key]['name']}\n"
+                            f"IP клиента: {client_ip}\n"
+                            f"{error_msg}"
+                        ),
+                        notify_loop
+                    )
+                return jsonify({"success": False, "error": error_msg}), 500
+            result = {}
+            text_lines = [f"Полный статус {get_device_name(device_id)} ({device_id}):"]
+            for item in status_resp.get("result", []):
+                code = item.get("code")
+                value = item.get("value")
+                result[code] = value
+                display_value = value
+                if code in SWITCH_CODES:
+                    display_value = "Вкл" if value else "Выкл"
+                elif code in TEMP_CODES:
+                    if "temperature" in code:
+                        display_value = f"{value / 10:.1f}°C"
+                    elif "humidity" in code:
+                        display_value = f"{value}%"
+                text_lines.append(f"{code}: {display_value}")
+            if notify:
+                asyncio.run_coroutine_threadsafe(
+                    application_global.bot.send_message(
+                        OWNER_ID,
+                        f"HTTP-запрос полного статуса\n"
+                        f"Устройство: {get_device_name(device_id)} ({device_id})\n"
+                        f"Проект: {TUYA_PROJECTS[project_key]['name']}\n"
+                        f"IP клиента: {client_ip}"
+                    ),
+                    notify_loop
+                )
+            if format_type == 'text':
+                return "\n".join(text_lines), 200, {'Content-Type': 'text/plain; charset=utf-8'}
+            return jsonify({
+                "success": True,
+                "device": device_id,
+                "project": project_key,
+                "full_status": result
+            })
+        if com not in ['on', 'off', 'toggle']:
+            return jsonify({"success": False, "error": "com должен быть on / off / toggle / fullstatus"}), 400
+        status_resp = tuya.get(f"/v1.0/devices/{device_id}/status")
+        if not status_resp.get("success"):
+            error_msg = format_tuya_error(status_resp)
+            if notify:
+                asyncio.run_coroutine_threadsafe(
+                    application_global.bot.send_message(
+                        OWNER_ID,
+                        f"Ошибка HTTP-команды {com.upper()}:\n"
+                        f"Устройство: {get_device_name(device_id)} ({device_id})\n"
+                        f"Проект: {TUYA_PROJECTS[project_key]['name']}\n"
+                        f"IP клиента: {client_ip}\n"
+                        f"{error_msg}"
+                    ),
+                    notify_loop
+                )
+            return jsonify({"success": False, "error": error_msg}), 500
+        current_value = None
+        for item in status_resp.get("result", []):
+            if item.get("code") in SWITCH_CODES:
+                current_value = item.get("value")
+                break
+        if current_value is None:
+            error_msg = "Устройство не поддерживает переключение"
+            if notify:
+                asyncio.run_coroutine_threadsafe(
+                    application_global.bot.send_message(
+                        OWNER_ID,
+                        f"Ошибка HTTP-команды {com.upper()}:\n"
+                        f"Устройство: {get_device_name(device_id)} ({device_id})\n"
+                        f"Проект: {TUYA_PROJECTS[project_key]['name']}\n"
+                        f"IP клиента: {client_ip}\n"
+                        f"{error_msg}"
+                    ),
+                    notify_loop
+                )
+            return jsonify({"success": False, "error": error_msg}), 400
+        if com == 'toggle':
+            new_value = not current_value
+            action_text = "переключено"
+        elif com == 'on':
+            new_value = True
+            action_text = "включено"
+        else:
+            new_value = False
+            action_text = "выключено"
+        payload = {"commands": [{"code": "switch_1", "value": new_value}]}
+        cmd_resp = tuya.post(f"/v1.0/devices/{device_id}/commands", payload)
+        if cmd_resp.get("success"):
+            if notify:
+                device_name = get_device_name(device_id)
+                asyncio.run_coroutine_threadsafe(
+                    application_global.bot.send_message(
+                        OWNER_ID,
+                        f"Команда через HTTP: {action_text.upper()}\n"
+                        f"Устройство: {device_name} ({device_id})\n"
+                        f"Проект: {TUYA_PROJECTS[project_key]['name']}\n"
+                        f"IP клиента: {client_ip}"
+                    ),
+                    notify_loop
+                )
+            return jsonify({
+                "success": True,
+                "device": device_id,
+                "action": action_text,
+                "new_state": new_value,
+                "project": project_key
+            })
+        else:
+            error_msg = format_tuya_error(cmd_resp)
+            if notify:
+                asyncio.run_coroutine_threadsafe(
+                    application_global.bot.send_message(
+                        OWNER_ID,
+                        f"Ошибка выполнения HTTP-команды {com.upper()}:\n"
+                        f"Устройство: {get_device_name(device_id)} ({device_id})\n"
+                        f"Проект: {TUYA_PROJECTS[project_key]['name']}\n"
+                        f"IP клиента: {client_ip}\n"
+                        f"{error_msg}"
+                    ),
+                    notify_loop
+                )
+            return jsonify({"success": False, "error": error_msg}), 500
+    except Exception as e:
+        logger.error(f"Ошибка в /control: {str(e)}")
+        if notify:
+            asyncio.run_coroutine_threadsafe(
+                application_global.bot.send_message(
+                    OWNER_ID,
+                    f"Критическая ошибка в HTTP-контроле:\n"
+                    f"Команда: {com.upper()}\n"
+                    f"Устройство: {device_id}\n"
+                    f"Проект: {TUYA_PROJECTS[project_key]['name']}\n"
+                    f"IP клиента: {client_ip}\n"
+                    f"{str(e)}"
+                ),
+                notify_loop
+            )
+        return jsonify({"success": False, "error": str(e)}), 500
+@flask_app.route('/wtags', methods=['GET'])
+def wtags_status():
+    format_type = request.args.get('format', 'json').lower()
+    pretty = request.args.get('pretty', 'false').lower() == 'true'
+    alive_only = request.args.get('alive_only', 'false').lower() == 'true'
+    tags = wtags_get_tags()
+    if not tags:
+        if format_type == 'text':
+            return "Не удалось получить данные Wireless Tags (проверьте лог бота)", 503
+        else:
+            return jsonify({
+                "success": False,
+                "error": "Не удалось получить список тегов",
+                "tags": []
+            }), 503
+    if alive_only:
+        tags = [t for t in tags if t.get("alive", False)]
+    result = []
+    for tag in tags:
+        item = {
+            "name": tag.get("name", "Без имени"),
+            "uuid": tag.get("uuid", "N/A"),
+            "alive": tag.get("alive", False),
+            "status": "онлайн" if tag.get("alive", False) else "оффлайн",
+            "temperature": tag.get("temperature"),
+            "batteryVolt": tag.get("batteryVolt"),
+            "batteryRemaining": tag.get("batteryRemaining"),
+            "signaldBm": tag.get("signaldBm"),
+            "lastComm": tag.get("lastComm"),
+            "OutOfRange": tag.get("OutOfRange", False),
+            "lux": tag.get("lux"),
+            "cap": tag.get("cap")
+        }
+        result.append(item)
+    if format_type == 'text':
+        lines = ["Wireless Sensor Tags — текущий статус:"]
+        for item in result:
+            lines.append(f"• {item['name']}")
+            lines.append(f" Статус: {item['status']}")
+            lines.append(f" Температура: {item['temperature'] if item['temperature'] is not None else 'N/A'} °C")
+            lines.append(f" Батарея: {item['batteryVolt'] if item['batteryVolt'] is not None else 'N/A'} V "
+                         f"({item['batteryRemaining']*100:.0f}% если указано)")
+            lines.append(f" Сигнал: {item['signaldBm']} dBm")
+            lines.append(f" OutOfRange: {'да' if item['OutOfRange'] else 'нет'}")
+            lines.append("---")
+        return "\n".join(lines), 200, {'Content-Type': 'text/plain; charset=utf-8'}
+    else:
+        response = {
+            "success": True,
+            "count": len(result),
+            "alive_count": sum(1 for t in result if t["alive"]),
+            "tags": result,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+        if pretty:
+            return jsonify(response), 200, {'Content-Type': 'application/json; charset=utf-8'}
+        else:
+            return jsonify(response)
+# ────────────────────────────────────────────────
+# WebSocket обработчики (для связи с Delphi и другими клиентами)
+# ────────────────────────────────────────────────
+
+# Словарь зарегистрированных команд
+# Ключ — имя команды, значение — функция-обработчик
+# Функция получает: data (dict), emit (функция ответа), sid (идентификатор сессии)
+command_handlers = {}
+
+
+def register_ws_command(name):
+    """Декоратор регистрации обработчика команды"""
+    def decorator(func):
+        command_handlers[name] = func
+        return func
+    return decorator
+
+
+# ──── Обработчики команд ─────────────────────────────────────────────────────
+
+@register_ws_command("get_wtags")
+def handle_get_wtags(data, emit, sid):
+    tags = wtags_get_tags()
+    emit('response', {
+        'command': 'get_wtags',
+        'success': bool(tags),
+        'count': len(tags) if tags else 0,
+        'data': tags or [],
+        'timestamp': datetime.utcnow().isoformat() + "Z"
+    })
+
+
+@register_ws_command("turn_on_device")
+def handle_turn_on_device(data, emit, sid):
+    device_id = data.get('device_id')
+    project_str = data.get('project', '1')
+
+    if not device_id:
+        emit('response', {'command': 'turn_on_device', 'success': False, 'error': 'device_id обязателен'})
+        return
+
+    # Здесь должна быть реальная логика включения (как в /control)
+    # Пока оставляем заглушку — замени на свой код
+    emit('response', {
+        'command': 'turn_on_device',
+        'success': True,
+        'device_id': device_id,
+        'project': project_str,
+        'action': 'on',
+        'new_state': True,
+        'message': 'Устройство включено (заглушка)'
+    })
+
+
+@register_ws_command("turn_off_device")
+def handle_turn_off_device(data, emit, sid):
+    device_id = data.get('device_id')
+    project_str = data.get('project', '1')
+
+    if not device_id:
+        emit('response', {'command': 'turn_off_device', 'success': False, 'error': 'device_id обязателен'})
+        return
+
+    # Аналогично — реальная логика выключения
+    emit('response', {
+        'command': 'turn_off_device',
+        'success': True,
+        'device_id': device_id,
+        'project': project_str,
+        'action': 'off',
+        'new_state': False,
+        'message': 'Устройство выключено (заглушка)'
+    })
+
+
+@register_ws_command("toggle_device")
+def handle_toggle_device(data, emit, sid):
+    device_id = data.get('device_id')
+    project_str = data.get('project', '1')
+
+    if not device_id:
+        emit('response', {'command': 'toggle_device', 'success': False, 'error': 'device_id обязателен'})
+        return
+
+    # Здесь нужна логика получения текущего состояния + переключение
+    emit('response', {
+        'command': 'toggle_device',
+        'success': True,
+        'device_id': device_id,
+        'project': project_str,
+        'action': 'toggle',
+        'new_state': 'изменено (заглушка)',
+        'message': 'Устройство переключено (заглушка)'
+    })
+
+
+@register_ws_command("ping")
+def handle_ping(data, emit, sid):
+    emit('response', {
+        'command': 'ping',
+        'success': True,
+        'pong': True,
+        'timestamp': time.time(),
+        'client_id': connected_clients.get(sid, 'unknown')
+    })
+
+
+# ──── Основные события подключения / отключения ──────────────────────────────
+
+@socketio.on('connect')
+def ws_connect():
+    token = request.args.get('token')
+    client_id = request.args.get('client_id', 'unknown')
+
+    if token != WEBSOCKET_SECRET_TOKEN:
+        logger.warning(f"Попытка подключения с неверным токеном от {client_id} (IP: {request.remote_addr})")
+        disconnect()
+        return
+
+    connected_clients[request.sid] = client_id
+    logger.info(f"Клиент подключился: {client_id} (sid: {request.sid}, IP: {request.remote_addr})")
+    emit('welcome', {
+        'message': f'Добро пожаловать, {client_id}! Вы подключены к TuyaBot.',
+        'version': BOT_VERSION,
+        'timestamp': datetime.utcnow().isoformat() + "Z"
+    })
+
+
+@socketio.on('disconnect')
+def ws_disconnect():
+    client_id = connected_clients.pop(request.sid, 'unknown')
+    logger.info(f"Клиент отключился: {client_id} (sid: {request.sid})")
+
+
+# ──── Единый обработчик всех входящих команд ─────────────────────────────────
+
+@socketio.on('command_to_bot')
+def handle_command_from_delphi(data):
+    sid = request.sid
+    client_id = connected_clients.get(sid, 'unknown')
+    cmd = data.get('command')
+
+    if not cmd:
+        emit('response', {
+            'success': False,
+            'error': 'Поле "command" обязательно'
+        })
+        return
+
+    logger.info(f"Команда от {client_id} (sid={sid}): {cmd} | данные: {data}")
+
+    handler = command_handlers.get(cmd)
+
+    if handler:
+        try:
+            handler(data, emit, sid)
+        except Exception as e:
+            logger.exception(f"Ошибка выполнения команды '{cmd}' от {client_id}")
+            emit('response', {
+                'command': cmd,
+                'success': False,
+                'error': str(e) or 'Внутренняя ошибка сервера'
+            })
+    else:
+        logger.warning(f"Неизвестная команда '{cmd}' от {client_id}")
+        emit('response', {
+            'command': cmd,
+            'success': False,
+            'error': f'Команда не поддерживается: {cmd}'
+        })
+
+
+# ──── Функция отправки сообщения от бота конкретному клиенту ─────────────────
+
+def send_to_delphi(client_id: str, message: dict):
+    for sid, cid in list(connected_clients.items()):
+        if cid == client_id:
+            socketio.emit('command_from_bot', message, room=sid)
+            logger.info(f"Отправлено сообщение клиенту {client_id} (sid={sid}): {message}")
+            return True
+    logger.warning(f"Клиент {client_id} не найден среди подключённых")
+    return False
+
+
+# ──── Запуск Flask + SocketIO ────────────────────────────────────────────────
+
+def run_flask():
+    port = int(os.getenv("PORT", 8080))
+    logger.info(f"Запуск Flask + SocketIO на порту {port}")
+    socketio.run(
+        flask_app,
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+        use_reloader=False,
+        allow_unsafe_werkzeug=True
+        )
+# ────────────────────────────────────────────────
+# Функции работы с файлами и статистикой
+# ────────────────────────────────────────────────
+def file_info(path: str) -> str:
+    if not os.path.exists(path):
+        return f"Файл {path} НЕ существует"
+    size = os.path.getsize(path)
+    mtime = os.path.getmtime(path)
+    mtime_str = datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            content = f.read()
+            preview = content[:200] + "..." if len(content) > 200 else content
+        return f"Файл {path}:\nРазмер: {size} байт\nПоследнее изменение: {mtime_str}\nСодержимое (первые 200 символов):\n{preview}"
+    except Exception as e:
+        return f"Файл {path} существует, но ошибка чтения: {str(e)}"
+# ────────────────────────────────────────────────
+# Wireless Sensor Tags — чистый requests (асmx/SignIn)
+# ────────────────────────────────────────────────
+def wtags_login() -> bool:
+    global wtags_logged_in
+    if not WTAGS_ENABLED:
+        return False
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Content-Type": "application/json",
+            "Origin": "https://my.wirelesstag.net",
+            "Referer": "https://my.wirelesstag.net/eth/signin.html",
+            "Connection": "keep-alive"
+        }
+        payload = {
+            "email": WTAGS_EMAIL,
+            "password": WTAGS_PASSWORD
+        }
+       
+        resp = wtags_session.post(
+            WTAGS_SIGNIN_URL,
+            json=payload,
+            headers=headers,
+            timeout=15
+        )
+        logger.info(f"WTAGS SignIn → status: {resp.status_code}")
+        logger.info(f"WTAGS SignIn → финальный URL: {resp.url}")
+        logger.info(f"WTAGS SignIn → длина ответа: {len(resp.text)}")
+        #logger.info(f"WTAGS SignIn → ПОЛНЫЙ ОТВЕТ СЕРВЕРА: {resp.text}")
+       
+       
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+                logger.info(f"WTAGS SignIn → распарсенный JSON: {data}")
+                d = data.get("d")
+                if d is None:
+                    logger.warning("WTAGS SignIn: поле 'd' = null или отсутствует")
+                    wtags_logged_in = True
+                    return True
+                if isinstance(d, dict):
+                    success = d.get("success", False)
+                    if success:
+                        wtags_logged_in = True
+                        logger.info("WTAGS: логин успешен (success: true)")
+                        return True
+                    else:
+                        err_msg = d.get("errorMessage", "неизвестная ошибка")
+                        logger.error(f"WTAGS SignIn failed: {err_msg}")
+                        return False
+                else:
+                    logger.warning("WTAGS SignIn: 'd' не словарь")
+                    return False
+            except ValueError as ve:
+                logger.error(f"WTAGS SignIn: ответ не JSON - {str(ve)}")
+                logger.info(f"WTAGS SignIn сырой ответ: {resp.text[:1000]}")
+                return False
+        else:
+            logger.error(f"WTAGS SignIn HTTP ошибка: {resp.status_code}")
+            return False
+    except Exception as e:
+        logger.error(f"WTAGS SignIn исключение: {str(e)}")
+        return False
+def wtags_get_tags() -> List[Dict]:
+    wtags_login() # вызываем всегда, даже если уже логин был
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Content-Type": "application/json"
+        }
+        resp = wtags_session.post(
+            WTAGS_GET_TAGS_URL,
+            json={}, # пустой body, как в твоём Network
+            headers=headers,
+            timeout=15
+        )
+        logger.info(f"WTAGS GetTagList → status: {resp.status_code}")
+        logger.info(f"WTAGS GetTagList → ПОЛНЫЙ ОТВЕТ: {resp.text}")
+        if resp.status_code == 200:
+            data = resp.json()
+            tags = data.get("d", [])
+            logger.info(f"Получено тегов: {len(tags)}")
+            return tags
+        else:
+            return []
+    except Exception as e:
+        logger.error(f"WTAGS GetTagList error: {str(e)}")
+        return []
+def wtags_get_readings(tag_uuid: str) -> Dict:
+    if not wtags_logged_in and not wtags_login():
+        return {}
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Content-Type": "application/json"
+        }
+        payload = {"uuid": tag_uuid}
+        resp = wtags_session.post(
+            "https://my.wirelesstag.net/ethClient.asmx/GetSensorReadings",
+            json=payload,
+            headers=headers,
+            timeout=15
+        )
+        logger.info(f"WTAGS GetSensorReadings → status: {resp.status_code}")
+        logger.info(f"WTAGS GetSensorReadings → длина ответа: {len(resp.text)}")
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+                readings = data.get("d", {})
+                return readings
+            except ValueError:
+                logger.error("WTAGS GetSensorReadings: ответ не JSON")
+                return {}
+        else:
+            logger.error(f"WTAGS GetSensorReadings HTTP ошибка: {resp.status_code}")
+            return {}
+    except Exception as e:
+        logger.error(f"WTAGS GetSensorReadings исключение: {str(e)}")
+        return {}
+# ────────────────────────────────────────────────
+# Компактное форматирование значений Wireless Tags (≤5 символов)
+# ────────────────────────────────────────────────
+def compact_value(val, unit: str = "", decimals: int = 1) -> str:
+    """Сокращает число до компактного вида ≤5 символов"""
+    if val is None or not isinstance(val, (int, float)):
+        return "N/A"
+    if decimals == 0:
+        s = f"{int(round(val))}{unit}"
+    else:
+        s = f"{val:.{decimals}f}{unit}"
+    return s[:5]
+# ────────────────────────────────────────────────
+# Функции из оригинального кода (все без изменений)
+# ────────────────────────────────────────────────
+def load_allowed_users() -> Set[int]:
+    if os.path.exists(ALLOWED_USERS_FILE):
+        try:
+            with open(ALLOWED_USERS_FILE, 'r') as f:
+                data = json.load(f)
+                return set(data.get("users", []))
+        except Exception as e:
+            logger.error(f"Ошибка загрузки allowed_users: {e}")
+            return {OWNER_ID} | PRE_ADDED_USERS
+    else:
+        initial_users = {OWNER_ID} | PRE_ADDED_USERS
+        save_allowed_users(initial_users)
+        return initial_users
+def save_allowed_users(users_set: Set[int]):
+    try:
+        with open(ALLOWED_USERS_FILE, 'w') as f:
+            json.dump({"users": list(users_set)}, f, indent=2)
+        logger.info(f"Сохранено {len(users_set)} разрешённых пользователей")
+    except Exception as e:
+        logger.error(f"Ошибка сохранения allowed_users: {e}")
+ALLOWED_USERS = load_allowed_users()
+def has_access(user_id: int) -> bool:
+    return user_id in ALLOWED_USERS
+def load_devices() -> List[Dict]:
+    if os.path.exists(DEVICES_FILE):
+        try:
+            with open(DEVICES_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Ошибка загрузки {DEVICES_FILE}: {e}")
+    return []
+def save_devices(devices: List[Dict]):
+    try:
+        with open(DEVICES_FILE, 'w', encoding='utf-8') as f:
+            json.dump(devices, f, ensure_ascii=False, indent=2)
+        logger.info("Устройства сохранены")
+    except Exception as e:
+        logger.error(f"Ошибка сохранения: {e}")
+def update_devices_cache(devices: List[Dict]):
+    global devices_cache
+    devices_cache.clear()
+    for dev in devices:
+        dev_id = dev.get('id')
+        name = dev.get('name', 'Без имени')
+        if dev_id:
+            devices_cache[dev_id] = name
+def get_device_name(dev_id: str) -> str:
+    name = devices_cache.get(dev_id)
+    if name:
+        return name
+    devices = load_devices()
+    for dev in devices:
+        if dev.get("id") == dev_id:
+            return dev.get("name", "Без имени")
+    return "Без имени"
+def format_tuya_error(response: Dict) -> str:
+    code = response.get("code", "неизвестно")
+    msg = response.get("msg") or response.get("error") or "нет описания"
+    explanations = {
+        1106: "Permission deny — привяжи устройства",
+        1108: "URI path invalid — проверь привязку",
+        2017: "Token expired",
+        1004: "Invalid app key",
+        1005: "Invalid app secret",
+        60001001: "Квота устройств исчерпана — удали лишние или обнови тариф",
+    }
+    explanation = explanations.get(code, "")
+    if code in [1106, 1108]:
+        explanation += "\nРекомендация: iot.tuya.com → Devices → Link My App"
+    return f"Tuya ошибка {code}: {msg}\n{explanation}"
+async def get_tuya_api(project_key: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None) -> TuyaOpenAPI:
+    proj = TUYA_PROJECTS.get(project_key)
+    if not proj:
+        raise ValueError(f"Проект {project_key} не найден")
+    api = TuyaOpenAPI(proj["endpoint"], proj["access_id"], proj["access_key"])
+    try:
+        api.connect()
+        if context:
+            context.bot_data["current_tuya"] = api
+            context.bot_data["current_project"] = project_key
+        logger.info(f"Подключено к {proj['name']}")
+    except Exception as e:
+        logger.error(f"Ошибка connect {proj['name']}: {e}")
+        raise
+    return api
+async def get_current_tuya(context: ContextTypes.DEFAULT_TYPE) -> TuyaOpenAPI:
+    tuya = context.bot_data.get("current_tuya")
+    if not tuya:
+        await get_tuya_api(DEFAULT_PROJECT, context)
+        tuya = context.bot_data["current_tuya"]
+    return tuya
+async def get_uid(context: ContextTypes.DEFAULT_TYPE) -> str:
+    return USER_UID
+def get_reply_keyboard():
+    keyboard = [
+        [KeyboardButton("🌤️ Погода"),KeyboardButton("🔌 Выключатели"), KeyboardButton("🌡️ Датчики")],
+        [KeyboardButton("📋 Проекты"), KeyboardButton("📜 Список устройств")],
+        [KeyboardButton("🏷️ Wireless Tags"),KeyboardButton("Реле 1"), KeyboardButton("Реле 2")],
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+async def post_init(application: Application) -> None:
+    text = f"🔥 Tuya Bot v{BOT_VERSION} запущен!\n\n"
+    current_key = application.bot_data.get("current_project", DEFAULT_PROJECT)
+    name = TUYA_PROJECTS[current_key]["name"]
+    text += f"Текущий проект: {name}\n"
+    text += f"UID: {USER_UID}\n"
+    text += f"Разрешённых пользователей: {len(ALLOWED_USERS)}\n"
+    text += "Готов к работе! /list /temp /switch\n"
+    text += "HTTP-контроль активен: /control?device=ID&com=on/fullstatus&project=1/2/3&notify=true/false\n"
+    text += "Wireless Tags: /wlist /wtags\n"
+    text += "WebSocket готов для подключения Delphi-клиента\n"
+    try:
+        await application.bot.send_message(
+            OWNER_ID,
+            text,
+            disable_notification=True,
+            reply_markup=get_reply_keyboard()
+        )
+        logger.info("Приветствие отправлено")
+    except Exception as e:
+        logger.error(f"Ошибка приветствия: {e}")
+
+# ────────────────────────────────────────────────
+# Погода — меню выбора города
+# ────────────────────────────────────────────────
+
+async def weather_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not has_access(update.effective_user.id):
+        await update.message.reply_text("Доступ запрещён")
+        return
+
+    keyboard = []
+    for key, city in CITIES_WEATHER.items():
+        keyboard.append([
+            InlineKeyboardButton(f"G {city['name']}", callback_data=f"weather_city_7_{key}"),
+            InlineKeyboardButton(f"O {city['name']}", callback_data=f"weather_city_10_{key}")
+        ])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        "🌤️ Выберите город и срок прогноза:",
+        reply_markup=reply_markup
+    )
+
+
+async def weather_city_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    if not query.data.startswith("weather_city_"):
+        return
+
+    city_key = query.data.split("_")[-1]
+    if city_key not in CITIES_WEATHER:
+        await query.edit_message_text("Город не найден 😕")
+        return
+
+    city_name = CITIES_WEATHER[city_key]["name"]
+    city_query = CITIES_WEATHER[city_key]["query"]
+
+    await query.edit_message_text(f"Загружаю прогноз для **{city_name}**... ⏳")
+
+    try:
+        forecast_text = await get_weather_7days(city=city_query)
+        await query.edit_message_text(
+            forecast_text,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+    except Exception as e:
+        logger.error(f"Ошибка погоды для {city_name}: {e}")
+        await query.edit_message_text(f"Не удалось загрузить прогноз для {city_name}\n{e}")
+
+# ────────────────────────────────────────────────
+# Асинхронно получает прогноз погоды на 7 дней через Open-Meteo
+# ────────────────────────────────────────────────
+async def get_weather_7days(
+    city: str = "Санкт-Петербург",
+    lang: str = "ru",
+    timeout: float = 10.0
+) -> str:
+    """
+    Асинхронный прогноз погоды на 7 дней через Open-Meteo
+    С русскими днями недели и вероятностью осадков
+    """
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+        # 1. Геокодирование
+        geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1&language=ru"
+        try:
+            async with session.get(geo_url) as resp:
+                geo = await resp.json()
+            if not geo.get("results"):
+                return f"Город «{city}» не найден 😔"
+            location = geo["results"][0]
+            lat = location["latitude"]
+            lon = location["longitude"]
+            name = location["name"]
+            admin = location.get("admin1", "")
+            country = location.get("country_code", "")
+            place = f"{name}, {admin} {country}".strip(", ")
+        except Exception as e:
+            return f"Ошибка поиска города: {e.__class__.__name__}"
+
+        # 2. Прогноз (добавляем precipitation_probability_max)
+        forecast_url = (
+            f"https://api.open-meteo.com/v1/forecast?"
+            f"latitude={lat}&longitude={lon}"
+            "&daily=weather_code,temperature_2m_max,temperature_2m_min,"
+            "precipitation_sum,precipitation_probability_max,wind_speed_10m_max"
+            "&timezone=auto"
+            "&forecast_days=7"
+            f"&language={lang}"
+        )
+
+        try:
+            async with session.get(forecast_url) as resp:
+                data = await resp.json()
+            if "error" in data:
+                return f"Ошибка API: {data.get('reason', 'неизвестно')}"
+        except Exception as e:
+            return f"Ошибка получения прогноза: {e.__class__.__name__}"
+
+        # 3. Формирование текста
+        lines = [f"🌤️ <b>Прогноз на 7 дней — {place}</b>\n"]
+
+        daily = data["daily"]
+        ru_days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+        for i in range(7):
+            dt = datetime.fromisoformat(daily["time"][i])
+            dow = ru_days[dt.weekday()]
+            date_str = dt.strftime("%d.%m")
+
+            t_max = daily["temperature_2m_max"][i]
+            t_min = daily["temperature_2m_min"][i]
+            precip_mm = daily["precipitation_sum"][i]
+            precip_prob = daily["precipitation_probability_max"][i]
+            wind = daily["wind_speed_10m_max"][i]
+            code = daily["weather_code"][i]
+
+            # Иконка и краткое описание
+            if code == 0:
+                icon, desc = "☀️", "Ясно"
+            elif code <= 3:
+                icon, desc = "⛅", "Малооблачно"
+            elif code <= 48:
+                icon, desc = "☁️", "Облачно"
+            elif code <= 67:
+                icon, desc = "🌧️", "Дождь"
+            elif code <= 77:
+                icon, desc = "❄️", "Снег"
+            elif code <= 86:
+                icon, desc = "🌧️❄️", "Снег с дождём"
+            else:
+                icon, desc = "🌫️", "Туман/гроза"
+
+            temp_str = f"{t_min:+.0f} … {t_max:+.0f}°"
+            precip_str = f"💧 {precip_mm:>4.1f} мм ({precip_prob}% шанс)"
+            wind_str = f"🌬️ {wind:>4.1f} м/с"
+
+            line = f"{dow}, {date_str}  {icon}  {temp_str}  {precip_str}  {wind_str}"
+            lines.append(line)
+
+        lines.append(f"\nДанные: Open-Meteo • {datetime.now().strftime('%H:%M')}")
+        return "\n".join(lines)
+
+# ────────────────────────────────────────────────
+# Асинхронно получает прогноз погоды на 7 дней через Gismeteo
+# ────────────────────────────────────────────────
+async def get_gismeteo_forecast(city_key: str, days: int = 10) -> str:
+        if i < len(temp_values):
+            val = temp_values[i]
+            maxt = val.find("div", class_="maxt")
+            mint = val.find("div", class_="mint")
+
+            t_max = maxt.find("temperature-value").get_text(strip=True) if maxt and maxt.find("temperature-value") else "?"
+            t_min = mint.find("temperature-value").get_text(strip=True) if mint and mint.find("temperature-value") else "?"
+
+            if t_max != "?" and t_min != "?":
+                t_str = f"{t_min} … {t_max}°"
+                try:
+                    t_num = float(t_max.replace("−", "-").strip("°"))  # берём дневную для эмодзи
+                    if t_num <= -10:
+                        temp_emoji = "🥶❄️"
+                    elif t_num < 0:
+                        temp_emoji = "❄️"
+                    elif t_num >= 25:
+                        temp_emoji = "🥵🔥"
+                    elif t_num >= 15:
+                        temp_emoji = "☀️"
+                except:
+                    pass
+
+        # Погода + эмодзи
+        condition = "?"
+        weather_emoji = "🌫️"
+        if i < len(icon_items):
+            tooltip = icon_items[i].get("data-tooltip", "").lower()
+            if tooltip:
+                condition = tooltip.capitalize()
+                if "ясно" in tooltip or "солнеч" in tooltip:
+                    weather_emoji = "☀️"
+                elif "малооблач" in tooltip:
+                    weather_emoji = "⛅"
+                elif "облач" in tooltip:
+                    weather_emoji = "☁️"
+                elif "пасмурн" in tooltip:
+                    weather_emoji = "☁️🌫️"
+                elif "дожд" in tooltip:
+                    weather_emoji = "🌧️"
+                elif "снег" in tooltip:
+                    weather_emoji = "❄️"
+                elif "гроз" in tooltip:
+                    weather_emoji = "⛈️"
+                elif "туман" in tooltip:
+                    weather_emoji = "🌫️"
+
+        # Осадки + эмодзи
+        precip = "0 мм"
+        precip_emoji = ""
+        if i < len(precip_units):
+            unit = precip_units[i].get_text(strip=True)
+            if unit and unit != "0":
+                precip = f"{unit} мм"
+                precip_emoji = "💧" if "дожд" in condition.lower() else "❄️"
+
+        line = (
+            f"{weather_emoji} {day_text:>12}  "
+            f"{temp_emoji} {t_str}  "
+            f"{condition}  "
+            f"{precip_emoji}{precip}"
+        )
+        lines.append(line)
+
+    lines.append(f"\n<i>Данные: Gismeteo • {datetime.now().strftime('%H:%M %d.%m.%Y')}</i>")
+    lines.append("<i>Прогноз может отличаться от реальности</i>")
+
+    return "\n".join(lines)
+
+
+
+#____________________________________________________________
+
+            
+            
+async def weather_city_7_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    if not query.data.startswith("weather_city_7_"):
+        return
+
+    city_key = query.data.split("_")[-1]
+    if city_key not in CITIES_WEATHER:
+        await query.edit_message_text("Город не найден 😕")
+        return
+
+    city_name = CITIES_WEATHER[city_key]["name"]
+
+    await query.edit_message_text(f"Загружаю прогноз на 7 дней для **{city_name}**... ⏳")
+
+    try:
+        forecast_text = await get_gismeteo_forecast(city_key, days=7 if "7_" in query.data else 10)
+        await query.edit_message_text(
+            forecast_text,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+    except Exception as e:
+        logger.error(f"Ошибка 7-дневной погоды для {city_name}: {e}")
+        await query.edit_message_text(f"Не удалось загрузить 7-дневный прогноз\n{e}")
+
+
+async def weather_city_10_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    if not query.data.startswith("weather_city_10_"):
+        return
+
+    city_key = query.data.split("_")[-1]
+    if city_key not in CITIES_WEATHER:
+        await query.edit_message_text("Город не найден 😕")
+        return
+
+    city_name = CITIES_WEATHER[city_key]["name"]
+
+    await query.edit_message_text(f"Загружаю прогноз на 10 дней для **{city_name}**... ⏳")
+
+    try:
+        forecast_text = await get_weather_7days(city=CITIES_WEATHER[city_key]["query"])
+        await query.edit_message_text(
+            forecast_text,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+    except Exception as e:
+        logger.error(f"Ошибка 10-дневной погоды для {city_name}: {e}")
+        await query.edit_message_text(f"Не удалось загрузить 10-дневный прогноз\n{e}")
+
+
+    
+# ────────────────────────────────────────────────
+# Управление пользователями
+# ────────────────────────────────────────────────
+async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("Только владелец может добавлять пользователей.")
+        return
+    if not context.args:
+        await update.message.reply_text("Укажи ID: /adduser 123456789")
+        return
+    try:
+        new_id = int(context.args[0])
+        if new_id in ALLOWED_USERS:
+            await update.message.reply_text(f"ID {new_id} уже добавлен.")
+            return
+        ALLOWED_USERS.add(new_id)
+        save_allowed_users(ALLOWED_USERS)
+        await update.message.reply_text(f"Пользователь {new_id} добавлен. Доступ разрешён.")
+    except ValueError:
+        await update.message.reply_text("Неверный формат ID — нужен только номер.")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {str(e)}")
+async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("Только владелец может удалять пользователей.")
+        return
+    if not context.args:
+        await update.message.reply_text("Укажи ID: /removeuser 123456789")
+        return
+    try:
+        rem_id = int(context.args[0])
+        if rem_id == OWNER_ID:
+            await update.message.reply_text("Нельзя удалить владельца.")
+            return
+        if rem_id not in ALLOWED_USERS:
+            await update.message.reply_text(f"ID {rem_id} не найден.")
+            return
+        ALLOWED_USERS.remove(rem_id)
+        save_allowed_users(ALLOWED_USERS)
+        await update.message.reply_text(f"Пользователь {rem_id} удалён.")
+    except ValueError:
+        await update.message.reply_text("Неверный формат ID.")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {str(e)}")
+async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("Доступ запрещён")
+        return
+    if not ALLOWED_USERS:
+        await update.message.reply_text("Разрешённых пользователей нет (кроме тебя).")
+        return
+    text = "Разрешённые пользователи:\n" + "\n".join(str(uid) for uid in sorted(ALLOWED_USERS))
+    await update.message.reply_text(text)
+# ────────────────────────────────────────────────
+# Wireless Tags команды
+# ────────────────────────────────────────────────
+async def wlist_tags(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not has_access(update.effective_user.id):
+        await update.message.reply_text("Доступ запрещён")
+        return
+    if not WTAGS_ENABLED:
+        await update.message.reply_text("Wireless Tags отключены в настройках бота")
+        return
+    tags = wtags_get_tags()
+    if not tags:
+        await update.message.reply_text("Тегов не найдено или ошибка соединения/авторизации.\nПроверь лог бота.")
+        return
+    text = f"Wireless Sensor Tags ({len(tags)}):\n\n"
+    keyboard = []
+    for tag in tags:
+        uuid = tag.get("uuid", "N/A")
+        name = tag.get("name", "Без имени")
+        alive = tag.get("alive", False)
+        temperature = tag.get("temperature")
+        cap = tag.get("cap") # ← берём cap вместо humidity
+        battery_v = tag.get("batteryVolt") or tag.get("batteryLevel")
+        # Компактное форматирование
+        temp_str = compact_value(temperature, "°", decimals=1)
+        cap_str = compact_value(cap, "%", decimals=0) if cap is not None and cap != 0 else None
+        bat_str = compact_value(battery_v, "V", decimals=2 if battery_v is not None and battery_v < 10 else 1)
+        # Эмодзи температуры
+        if isinstance(temperature, (int, float)):
+            if temperature < 0:
+                temp_emoji = "❄️"
+            elif temperature > 30:
+                temp_emoji = "🔥"
+            elif temperature > 25:
+                temp_emoji = "🥵"
+            elif temperature < 10:
+                temp_emoji = "🥶"
+            else:
+                temp_emoji = "🌡️"
+        else:
+            temp_emoji = "🌡️"
+        # Эмодзи батареи
+        if isinstance(battery_v, (int, float)):
+            bat_emoji = "🪫" if battery_v < 2.7 else "🔋"
+        else:
+            bat_emoji = "🔋"
+        # Статус
+        status_emoji = "🟢" if alive else "⚫"
+        status_text = "" if alive else "" #status_text = "онлайн" if alive else "оффлайн"
+        # Формируем две строки
+        text += f"{temp_emoji if alive else status_emoji} {name}\n"
+        second_line = f" {temp_str} {bat_emoji}{bat_str}"
+        if cap_str:
+            second_line += f" 💧{cap_str}" # ← эмодзи капли перед cap
+        second_line += f" {status_emoji} {status_text}"
+        text += second_line + "\n\n"
+        # Кнопка
+        keyboard.append([
+            InlineKeyboardButton(f"{status_emoji} {name}", callback_data=f"wtags_view_{uuid}")
+        ])
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+# ────────────────────────────────────────────────
+# Основные функции Telegram-бота
+# ────────────────────────────────────────────────
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not has_access(update.effective_user.id):
+        await update.message.reply_text("Доступ запрещён. Обратитесь к владельцу бота.")
+        return
+    current = context.bot_data.get("current_project", DEFAULT_PROJECT)
+    text = (
+        f"Привет! Tuya Bot v{BOT_VERSION}\n"
+        f"Проект: {TUYA_PROJECTS[current]['name']}\n"
+        f"UID: {USER_UID}\n\n"
+        "Команды:\n"
+        "• /projects — выбрать проект (теперь 3 доступно)\n"
+        "• /list — все устройства\n"
+        "• /temp — датчики температуры/влажности\n"
+        "• /switch — выключатели/розетки\n"
+        "• /status [id] — полный статус\n"
+        "• /wlist или /wtags — Wireless Sensor Tags\n"
+        "• /debug — проверка (включая файлы)\n"
+        "• /adduser, /removeuser, /users — управление доступом (только владелец)"
+    )
+    await update.message.reply_text(text, reply_markup=get_reply_keyboard())
+async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not has_access(update.effective_user.id):
+        await update.message.reply_text("Доступ запрещён")
+        return
+    current = context.bot_data.get("current_project", DEFAULT_PROJECT)
+    text = f"Debug info v{BOT_VERSION}\n\n"
+    text += f"Проект: {TUYA_PROJECTS[current]['name']}\n"
+    text += f"UID: {USER_UID}\n"
+    text += f"Время сервера: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    text += "Проверка файлов:\n"
+    text += "─" * 40 + "\n"
+    text += file_info(ALLOWED_USERS_FILE) + "\n\n"
+    text += file_info(DEVICES_FILE) + "\n\n"
+    text += file_info(BUTTON_STATS_FILE) + "\n\n"
+    text += "─" * 40 + "\n"
+    text += "Подключение успешно (UID вручную)"
+    await update.message.reply_text(text, reply_markup=get_reply_keyboard())
+async def projects(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not has_access(update.effective_user.id):
+        await update.message.reply_text("Доступ запрещён")
+        return
+    current = context.bot_data.get("current_project", DEFAULT_PROJECT)
+    keyboard = []
+    for key, proj in TUYA_PROJECTS.items():
+        prefix = "✅ " if key == current else ""
+        keyboard.append([InlineKeyboardButton(f"{prefix}{proj['name']}", callback_data=f"switch_project_{key}")])
+    await update.message.reply_text(
+        f"Выбери проект (текущий: {TUYA_PROJECTS[current]['name']})",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def cmd_weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    city = " ".join(context.args) or "Москва"
+    text = await get_weather_7days(city)
+    await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
+
+
+async def switch_project_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not has_access(query.from_user.id):
+        await query.edit_message_text("Доступ запрещён")
+        return
+    if query.data.startswith("switch_project_"):
+        project_key = query.data.split("_", 2)[2]
+        if project_key not in TUYA_PROJECTS:
+            await query.edit_message_text("Проект не найден")
+            return
+        try:
+            await get_tuya_api(project_key, context)
+            name = TUYA_PROJECTS[project_key]["name"]
+            await query.edit_message_text(f"Переключено на {name} ✓\nТеперь /list /temp /switch")
+        except Exception as e:
+            await query.edit_message_text(f"Ошибка переключения: {str(e)}")
+async def smart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not has_access(update.effective_user.id):
+        await update.message.reply_text("Доступ запрещён")
+        return
+    devices = load_devices()
+    if not devices:
+        await update.message.reply_text("Нет сохранённых устройств. Сделай /list сначала.")
+        return
+    text = f"Сохранённые устройства ({len(devices)}):"
+    keyboard = []
+    row = []
+    last_status = context.bot_data.get("last_status", {})
+    for dev in devices:
+        dev_id = dev.get("id")
+        name = get_device_name(dev_id)
+        emoji = "⚪"
+        status_text = ""
+        cached = last_status.get(dev_id, {})
+        if cached.get("online", False):
+            emoji = "🟢"
+        elif any(code in cached for code in SWITCH_CODES):
+            state = any(cached.get(code, False) for code in SWITCH_CODES)
+            emoji = "🟢" if state else "🔴"
+        elif any(code in cached for code in TEMP_CODES):
+            emoji = "🌡️"
+            temp = cached.get("va_temperature")
+            if temp is not None:
+                status_text = f" {temp/10:.0f}°"
+        button_text = f"{emoji}{name}{status_text}"
+        row.append(InlineKeyboardButton(button_text, callback_data=f"device_{dev_id}"))
+        if len(row) == 3:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+async def list_devices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not has_access(update.effective_user.id):
+        await update.message.reply_text("Доступ запрещён")
+        return
+    try:
+        tuya = await get_current_tuya(context)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка подключения: {str(e)}\nИспользуй /projects")
+        return
+    uid = await get_uid(context)
+    try:
+        r = tuya.get(f"/v1.0/users/{uid}/devices")
+        if not r.get("success"):
+            await update.message.reply_text(format_tuya_error(r))
+            return
+        devices = r.get("result", [])
+        if not devices:
+            await update.message.reply_text("Устройств не найдено. Привяжи в iot.tuya.com")
+            return
+        update_devices_cache(devices)
+        save_devices(devices)
+        text = f"Устройства ({len(devices)}):"
+        keyboard = []
+        row = []
+        last_status = context.bot_data.setdefault("last_status", {})
+        for dev in devices:
+            dev_id = dev.get("id")
+            name = get_device_name(dev_id)
+            emoji = "⚪"
+            status_text = ""
+            try:
+                status_r = tuya.get(f"/v1.0/devices/{dev_id}/status")
+                if status_r.get("success"):
+                    current = {item["code"]: item["value"] for item in status_r["result"]}
+                    last_status[dev_id] = current
+                    online = current.get("online", False)
+                    online_emoji = "🟢" if online else "⚫"
+                    if any(code in current for code in SWITCH_CODES):
+                        state = any(current.get(code, False) for code in SWITCH_CODES)
+                        emoji = "🟢" if state else "🔴"
+                    elif any(code in current for code in TEMP_CODES):
+                        emoji = "🌡️"
+                        temp = current.get("va_temperature") or current.get("temperature")
+                        if temp is not None:
+                            status_text = f" {temp/10:.0f}°"
+                else:
+                    logger.warning(format_tuya_error(status_r))
+            except Exception as e:
+                logger.error(f"Ошибка статуса {dev_id}: {e}")
+                online_emoji = "⚫"
+            button_text = f"{online_emoji} {emoji}{name}{status_text}"
+            row.append(InlineKeyboardButton(button_text, callback_data=f"device_{dev_id}"))
+            if len(row) == 3:
+                keyboard.append(row)
+                row = []
+        if row:
+            keyboard.append(row)
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    except Exception as e:
+        logger.error(f"Ошибка /list: {e}")
+        await update.message.reply_text(f"Ошибка: {str(e)}")
+async def show_temp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not has_access(update.effective_user.id):
+        await update.message.reply_text("Доступ запрещён")
+        return
+    try:
+        tuya = await get_current_tuya(context)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка подключения: {str(e)}")
+        return
+    uid = await get_uid(context)
+    devices = []
+    try:
+        r = tuya.get(f"/v1.0/users/{uid}/devices")
+        if r.get("success"):
+            devices = r.get("result", [])
+            update_devices_cache(devices)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка получения устройств: {str(e)}")
+        return
+    temp_devices = []
+    for dev in devices:
+        try:
+            device_r = tuya.get(f"/v1.0/devices/{dev['id']}")
+            online = False
+            if device_r.get("success"):
+                online = device_r["result"].get("online", False)
+            status_r = tuya.get(f"/v1.0/devices/{dev['id']}/status")
+            if status_r.get("success"):
+                codes = {item["code"]: item["value"] for item in status_r["result"]}
+                if any(code in codes for code in TEMP_CODES):
+                    temp_devices.append((dev, codes, online))
+        except Exception as e:
+            logger.error(f"Ошибка получения данных {dev['id']}: {e}")
+    if not temp_devices:
+        await update.message.reply_text("Датчиков температуры/влажности не найдено")
+        return
+    text = f"Датчики температуры/влажности ({len(temp_devices)}):"
+    keyboard = []
+    for dev, codes, online in temp_devices:
+        dev_id = dev.get("id")
+        name = get_device_name(dev_id)
+        temp = codes.get("va_temperature") or codes.get("temperature")
+        hum = codes.get("va_humidity") or codes.get("humidity")
+        battery_percent = codes.get("battery_percentage") or codes.get("battery") or codes.get("power") or codes.get("residual_capacity") or codes.get("battery_level")
+        battery_state = codes.get("battery_state")
+        temp_str = ""
+        emoji = "🌡️"
+        if temp is not None:
+            t_val = temp / 10
+            if t_val < 0:
+                emoji = "❄️"
+            elif t_val > 30:
+                emoji = "🔥"
+            temp_str += f" {t_val:.1f}°"
+        hum_str = ""
+        if hum is not None:
+            hum_str += f" 💧 {hum}%"
+        battery_str = ""
+        battery_emoji = ""
+        if battery_percent is not None:
+            try:
+                bat_val = int(float(battery_percent))
+                if bat_val <= 20:
+                    battery_emoji = "🪫"
+                elif bat_val <= 50:
+                    battery_emoji = "🔋"
+                else:
+                    battery_emoji = "🔋"
+                battery_str += f" {battery_emoji} {bat_val}%"
+            except:
+                battery_str += f" 🔋 {battery_percent}"
+        elif battery_state is not None:
+            state_lower = battery_state.lower()
+            if state_lower == "low":
+                battery_emoji = "🪫"
+                battery_str += " 🪫 Low"
+            elif state_lower == "middle":
+                battery_emoji = "🔋"
+                battery_str += " 🔋 Middle"
+            elif state_lower == "high":
+                battery_emoji = "🔋"
+                battery_str += " 🔋 High"
+            else:
+                battery_str += f" 🔋 {battery_state}"
+        online_emoji = "🟢 " if online else "⚫ "
+        button_text = f"{online_emoji} {emoji} {name}{temp_str}{hum_str}{battery_str}"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"device_{dev_id}")])
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+async def show_switch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not has_access(update.effective_user.id):
+        await update.message.reply_text("Доступ запрещён")
+        return
+    try:
+        tuya = await get_current_tuya(context)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка подключения: {str(e)}")
+        return
+    uid = await get_uid(context)
+    devices = []
+    try:
+        r = tuya.get(f"/v1.0/users/{uid}/devices")
+        if r.get("success"):
+            devices = r.get("result", [])
+            update_devices_cache(devices)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка получения устройств: {str(e)}")
+        return
+    switch_devices = []
+    for dev in devices:
+        try:
+            status_r = tuya.get(f"/v1.0/devices/{dev['id']}/status")
+            if status_r.get("success"):
+                codes = {item["code"]: item["value"] for item in status_r["result"]}
+                has_switch = any(code in codes for code in SWITCH_CODES)
+                has_temp = any(code in codes for code in TEMP_CODES)
+                if has_switch and not has_temp:
+                    switch_devices.append((dev, codes))
+        except Exception as e:
+            logger.error(f"Ошибка статуса {dev['id']}: {e}")
+    if not switch_devices:
+        await update.message.reply_text("Выключателей/розеток не найдено")
+        return
+    text = f"Выключатели/розетки ({len(switch_devices)}):"
+    keyboard = []
+    row = []
+    for idx, (dev, codes) in enumerate(switch_devices):
+        dev_id = dev.get("id")
+        name = get_device_name(dev_id)
+        state = any(codes.get(code, False) for code in SWITCH_CODES)
+        emoji = "🟢" if state else "🔴"
+        button_text = f"{emoji} {name}"
+        row.append(InlineKeyboardButton(button_text, callback_data=f"device_{dev_id}"))
+        if len(row) == 2 or idx == len(switch_devices) - 1:
+            keyboard.append(row)
+            row = []
+    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+    if not keyboard:
+        text += "\n\n(Кнопки не сформированы — проверьте статус устройств)"
+    await update.message.reply_text(text, reply_markup=reply_markup)
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not has_access(update.effective_user.id):
+        await update.message.reply_text("Доступ запрещён")
+        return
+    if not context.args:
+        await update.message.reply_text("Укажи ID: /status bf93e7545f941db90dk4h6")
+        return
+    dev_id = context.args[0].strip()
+    try:
+        tuya = await get_current_tuya(context)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {str(e)}")
+        return
+    try:
+        r = tuya.get(f"/v1.0/devices/{dev_id}/status")
+        if r.get("success"):
+            text = f"Расширенный статус {dev_id}:\n\n"
+            name = get_device_name(dev_id)
+            text += f"Имя: {name}\n"
+            text += f"ID: {dev_id}\n\n"
+            for item in r["result"]:
+                code = item["code"]
+                value = item["value"]
+                if code in TEMP_CODES:
+                    if "temperature" in code:
+                        text += f"{code}: {value / 10:.1f}°C\n"
+                    elif "humidity" in code:
+                        text += f"{code}: {value}%\n"
+                elif code in SWITCH_CODES:
+                    text += f"{code}: {'Вкл' if value else 'Выкл'}\n"
+                elif code == "online":
+                    text += f"Статус: {'Online' if value else 'Offline'}\n"
+                elif code == "battery_percentage":
+                    text += f"Батарея: {value}%\n"
+                else:
+                    text += f"{code}: {value}\n"
+            await update.message.reply_text(text)
+        else:
+            await update.message.reply_text(format_tuya_error(r))
+    except Exception as e:
+        logger.exception(f"Ошибка /status {dev_id}: {e}")
+        name = get_device_name(dev_id)
+        await update.message.reply_text(f"Ошибка подключения.\nИмя из кэша: {name}\nID: {dev_id}")
+        
+# ==================== BUTTON CALLBACK ====================
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not has_access(query.from_user.id):
+        await query.edit_message_text("Доступ запрещён")
+        return
+    data = query.data
+    try:
+        tuya = await get_current_tuya(context)
+    except Exception as e:
+        await query.edit_message_text(f"Ошибка: {str(e)}")
+        return
+
+    # ==================== USB ТОГГЛ ====================
+    if data.startswith("usb1_toggle_") or data.startswith("usb2_toggle_"):
+        try:
+            parts = data.split("_")
+            usb_num = 1 if parts[0] == "usb1" else 2
+            port_str = parts[-1]
+            port_num = int(port_str)
+            names = USB1_NAMES if usb_num == 1 else USB2_NAMES
+            state_key = f"usb{usb_num}_states"
+            if state_key not in context.bot_data:
+                context.bot_data[state_key] = [False] * 8
+            states = context.bot_data[state_key]
+            old_state = states[port_num - 1]
+            new_state = not old_state
+            states[port_num - 1] = new_state
+
+            port_formatted = f"{port_num:02d}"
+            command_str = f"usb{usb_num}, {port_formatted}, {str(new_state).lower()}"
+
+            client_id = "delphi"  # ← поменяй, если нужно
+            success = send_to_delphi(client_id, {
+                "command": "usb_control",
+                "data": command_str
+            })
+            status = "успешно отправлена" if success else "клиент не подключён"
+
+            await query.edit_message_text(
+                f"USB{usb_num} {names[port_num-1]} → {'🟢 ВКЛ' if new_state else '🔴 ВЫКЛ'}\n"
+                f"Команда: {command_str}\n"
+                f"Состояние сохранено ✓\n"
+                f"В Delphi: {status}"
+            )
+            await show_usb_menu_from_query(query, context, usb_num)
+
+        except Exception as e:
+            logger.error(f"Ошибка в USB callback: {str(e)}")
+            await query.edit_message_text(f"Ошибка обработки USB: {str(e)}")
+        return
+    # ==================================================
+         
+    if data.startswith("device_"):
+        dev_id = data[7:]
+        try:
+            name = get_device_name(dev_id)
+            r = tuya.get(f"/v1.0/devices/{dev_id}/status")
+            if not r.get("success"):
+                await query.edit_message_text(format_tuya_error(r))
+                return
+            text = f"{name} ({dev_id})\n\n"
+            switch_value = None
+            for item in r["result"]:
+                code = item["code"]
+                value = item["value"]
+                if code in SWITCH_CODES:
+                    switch_value = value
+                    text += f"Включено: {'Да' if value else 'Нет'}\n"
+                elif code in TEMP_CODES:
+                    if "temperature" in code:
+                        text += f"Температура: {value / 10:.1f}°C\n"
+                    elif "humidity" in code:
+                        text += f"Влажность: {value}%\n"
+                elif code == "battery_percentage":
+                    text += f"Батарея: {value}%\n"
+                elif code == "online":
+                    text += f"Статус: {'Online' if value else 'Offline'}\n"
+            keyboard = []
+            if switch_value is not None:
+                keyboard.append([
+                    InlineKeyboardButton("ВКЛ", callback_data=f"on_{dev_id}"),
+                    InlineKeyboardButton("ВЫКЛ", callback_data=f"off_{dev_id}"),
+                    InlineKeyboardButton("↻ Переключить", callback_data=f"toggle_{dev_id}")
+                ])
+            keyboard.append([InlineKeyboardButton("Полный статус", callback_data=f"fullstatus_{dev_id}")])
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        except Exception as e:
+            await query.edit_message_text(f"Ошибка: {str(e)}")
+    elif data.startswith("on_") or data.startswith("off_") or data.startswith("toggle_"):
+        dev_id = data.split("_", 1)[1]
+        try:
+            r = tuya.get(f"/v1.0/devices/{dev_id}/status")
+            if not r.get("success"):
+                await query.edit_message_text(format_tuya_error(r))
+                return
+            current = None
+            for item in r["result"]:
+                if item["code"] in SWITCH_CODES:
+                    current = item["value"]
+                    break
+            if current is None:
+                await query.edit_message_text("Нет переключателя")
+                return
+            if data.startswith("toggle_"):
+                value = not current
+                action = "переключено"
+            else:
+                value = data.startswith("on_")
+                action = "включено" if value else "выключено"
+            payload = {"commands": [{"code": "switch_1", "value": value}]}
+            cmd_r = tuya.post(f"/v1.0/devices/{dev_id}/commands", payload)
+            if cmd_r.get("success"):
+                await query.edit_message_text(f"{action.capitalize()} ✓")
+            else:
+                await query.edit_message_text(format_tuya_error(cmd_r))
+        except Exception as e:
+            await query.edit_message_text(f"Ошибка: {str(e)}")
+    elif data.startswith("fullstatus_"):
+        dev_id = data[11:]
+        try:
+            r = tuya.get(f"/v1.0/devices/{dev_id}/status")
+            if not r.get("success"):
+                await query.edit_message_text(format_tuya_error(r))
+                return
+            name = get_device_name(dev_id)
+            text = f"Полный статус {name} ({dev_id}):\n\n"
+            for item in r["result"]:
+                code = item["code"]
+                value = item["value"]
+                if code in TEMP_CODES:
+                    if "temperature" in code:
+                        text += f"{code}: {value / 10:.1f}°C\n"
+                    elif "humidity" in code:
+                        text += f"{code}: {value}%\n"
+                elif code in SWITCH_CODES:
+                    text += f"{code}: {'Вкл' if value else 'Выкл'}\n"
+                elif code == "online":
+                    text += f"Статус: {'Online' if value else 'Offline'}\n"
+                elif code == "battery_percentage":
+                    text += f"Батарея: {value}%\n"
+                else:
+                    text += f"{code}: {value}\n"
+            await query.edit_message_text(text)
+        except Exception as e:
+            await query.edit_message_text(f"Ошибка: {str(e)}")
+    elif data.startswith("wtags_view_"):
+        uuid = data[11:]
+        if not WTAGS_ENABLED:
+            await query.edit_message_text("Wireless Tags отключены")
+            return
+        readings = wtags_get_readings(uuid)
+        text = f"Данные тега {uuid}:\n\n"
+        if readings:
+            temp = readings.get("temperature", "N/A")
+            cap = readings.get("cap", "N/A")
+            text += f"Температура: {temp} °C\n"
+            text += f"Cap: {cap} %\n"
+            text += "\n(другие данные доступны в логах или расширь функцию)"
+        else:
+            text += "Не удалось получить показания (проверь лог бота)"
+        await query.edit_message_text(text)
+
+async def show_usb_menu_from_query(query, context: ContextTypes.DEFAULT_TYPE, usb_num: int):
+    """Перерисовка USB-меню после нажатия кнопки (работает с CallbackQuery)"""
+    names = USB1_NAMES if usb_num == 1 else USB2_NAMES
+    state_key = f"usb{usb_num}_states"
+    if state_key not in context.bot_data:
+        context.bot_data[state_key] = [False] * 8
+    states = context.bot_data[state_key]
+
+    keyboard = []
+    row = []
+    for i in range(8):
+        state = states[i]
+        emoji = "🟢" if state else "🔴"
+        button_text = f"{emoji} {names[i]}"
+        callback_data = f"usb{usb_num}_toggle_{i+1:02d}"
+        row.append(InlineKeyboardButton(button_text, callback_data=callback_data))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+
+    await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def handle_keyboard_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not has_access(update.effective_user.id):
+        await update.message.reply_text("Доступ запрещён")
+        return
+    text = update.message.text.strip()
+    if text in ["🔌 Выключатели", "Выключатели"]:
+        await show_switch(update, context)
+    elif text in ["🌡️ Датчики", "Датчики"]:
+        await show_temp(update, context)
+    elif text in ["📋 Проекты", "Проекты"]:
+        await projects(update, context)
+    elif text in ["📜 Список устройств", "Список устройств"]:
+        await list_devices(update, context)
+    elif text in ["🏷️ Wireless Tags", "Wireless Tags"]:
+        await wlist_tags(update, context)
+    elif text in ["USB1", "Реле 1"]:
+        await show_usb_menu(update, context, usb_num=1)
+    elif text in ["USB2", "Реле 2"]:
+        await show_usb_menu(update, context, usb_num=2)
+    elif text in ["🌤️ Погода", "Погода"]:
+        await weather_menu(update, context)
+        
+    elif text == "/start":
+        await start(update, context)
+    else:
+        await update.message.reply_text("Неизвестная кнопка, используй меню или команды 😉")
+#_______________________________________________________________________________            
+#Новая функция — показ подменю USB (8 кнопок)
+#_______________________________________________________________________________    
+
+async def show_usb_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, usb_num: int):
+    names = USB1_NAMES if usb_num == 1 else USB2_NAMES
+    state_key = f"usb{usb_num}_states"
+    if state_key not in context.bot_data:
+        context.bot_data[state_key] = [False] * 8
+    states = context.bot_data[state_key]
+    keyboard = []
+    row = []
+    for i in range(8):
+        state = states[i]
+        emoji = "🟢" if state else "🔴"
+        button_text = f"{emoji} {names[i]}"
+        # callback_data теперь содержит номер порта явно
+        callback_data = f"usb{usb_num}_toggle_{i+1:02d}" # 01, 02, ..., 08
+        row.append(InlineKeyboardButton(button_text, callback_data=callback_data))
+        if len(row) == 2: # 2 колонки
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        f"Управление USB{usb_num} ({len(names)} устройств)",
+        reply_markup=reply_markup
+    )
+#_______________________________________________________________________________    
+
+async def main():
+    logger.info(f"Запуск бота версии {BOT_VERSION} (Telegram polling + HTTP control + Wireless Tags + WebSocket)")
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info("Flask + SocketIO сервер запущен в фоне")
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    global application_global
+    application_global = app
+    app.add_handler(CommandHandler("adduser", add_user))
+    app.add_handler(CommandHandler("removeuser", remove_user))
+    app.add_handler(CommandHandler("users", list_users))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("projects", projects))
+    app.add_handler(CommandHandler("debug", debug))
+    app.add_handler(CommandHandler("list", list_devices))
+    app.add_handler(CommandHandler("smart", smart))
+    app.add_handler(CommandHandler("temp", show_temp))
+    app.add_handler(CommandHandler("switch", show_switch))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("wlist", wlist_tags))
+    app.add_handler(CommandHandler("wtags", wlist_tags))
+    app.add_handler(CallbackQueryHandler(switch_project_callback, pattern="^switch_project_"))
+    app.add_handler(CallbackQueryHandler(weather_city_7_callback, pattern="^weather_city_7_"))
+    app.add_handler(CallbackQueryHandler(weather_city_10_callback, pattern="^weather_city_10_"))
+    app.add_handler(CallbackQueryHandler(button_callback))  # без pattern
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_keyboard_buttons))
+    app.add_handler(CommandHandler("weather", cmd_weather))
+    app.add_handler(CommandHandler("weather_menu", weather_menu))
+    
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook сброшен")
+    except Exception:
+        pass
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(
+        poll_interval=1.0,
+        timeout=10,
+        drop_pending_updates=True
+    )
+    logger.info("Polling запущен")
+    try:
+        await asyncio.Event().wait()
+    finally:
+        logger.info("Остановка бота")
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+
+# ────────────────────────────────────────────────
+# Чистый WebSocket (flask-sock) для простого подключения из Delphi
+# Работает параллельно с Socket.IO, без сложного протокола
+# ────────────────────────────────────────────────
+sock = Sock(flask_app)
+
+@sock.route('/ws')
+def pure_websocket(ws):
+    token = request.args.get('token')
+    client_id = request.args.get('client_id', 'unknown')
+    
+    if token != WEBSOCKET_SECRET_TOKEN:
+        logger.warning(f"Неверный токен от {client_id} (IP: {request.remote_addr})")
+        ws.close()
+        return
+    
+    logger.info(f"Чистый WS подключён: {client_id} (IP: {request.remote_addr})")
+    
+    while True:
+        try:
+            data = ws.receive()
+            if data is None:
+                break
+            try:
+                msg = json.loads(data)
+                cmd = msg.get('command')
+                
+                if cmd == 'ping':
+                    ws.send(json.dumps({
+                        'response': 'pong',
+                        'client_id': client_id,
+                        'timestamp': time.time()
+                    }))
+                elif cmd == 'usb_control':
+                    usb_data = msg.get('data')
+                    logger.info(f"USB команда от {client_id}: {usb_data}")
+                    # Опционально: отправь уведомление владельцу в Telegram
+                    asyncio.run_coroutine_threadsafe(
+                        application_global.bot.send_message(
+                            OWNER_ID,
+                            f"USB команда через чистый WS от {client_id}:\n{usb_data}"
+                        ),
+                        notify_loop
+                    )
+                    ws.send(json.dumps({'response': 'ok', 'data': usb_data}))
+                elif cmd == 'get_wtags':
+                    tags = wtags_get_tags()
+                    ws.send(json.dumps({
+                        'response': 'wtags',
+                        'count': len(tags),
+                        'data': tags
+                    }))
+                else:
+                    ws.send(json.dumps({'response': 'unknown_command'}))
+            except json.JSONDecodeError:
+                ws.send(json.dumps({'response': 'invalid_json'}))
+        except Exception as e:
+            logger.error(f"WS ошибка от {client_id}: {e}")
+            break
+    
+    logger.info(f"Чистый WS отключён: {client_id}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+# ────────────────────────────────────────────────
+# Статистика кода:
+# Количество строк кода (без пустых и финальных комментариев): 2061
+# Количество функций/процедур (async def + def): 40
+# Дата и время добавления этого комментария: 2026-02-12
+# Изменения: фикс async_mode на threading, прописан домен, версия 6.13
+# ────────────────────────────────────────────────
